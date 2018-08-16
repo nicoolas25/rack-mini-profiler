@@ -234,6 +234,7 @@ module Rack
       end
 
       flamegraph = nil
+      stackprof = nil
 
       trace_exceptions = query_string =~ /pp=trace-exceptions/ && defined? TracePoint
       status, headers, body, exceptions,trace = nil
@@ -281,6 +282,31 @@ module Rack
               status,headers,body = @app.call(env)
             end
           end
+        elsif query_string =~ /pp=stackprof/
+          # If it raises, that's too bad...
+          require 'stackprof'
+          require 'json'
+
+          # do not sully our profile with mini profiler timings
+          current.measure = false
+          match_data = query_string.match(/stackprof_sample_rate=([\d\.]+)/)
+
+          if match_data && !match_data[1].to_f.zero?
+            sample_rate = match_data[1].to_f
+          else
+            sample_rate = config.stackprof_sample_rate
+          end
+
+          profile = StackProf.run(mode: :cpu, raw: true, interval: 1000 * sample_rate) do
+            status,headers,body = @app.call(env)
+          end
+
+          stackprof = StringIO.new
+
+          # TODO: Allow output type selection
+          StackProf::Report.new(profile).print_callgrind(stackprof)
+
+          stackprof = stackprof.string
         else
           status,headers,body = @app.call(env)
         end
@@ -335,6 +361,10 @@ module Rack
         return client_settings.handle_cookie(self.flamegraph(flamegraph))
       end
 
+      if stackprof
+        body.close if body.respond_to? :close
+        return client_settings.handle_cookie(self.stackprof(stackprof))
+      end
 
       begin
         @storage.save(page_struct)
@@ -549,6 +579,8 @@ Append the following to your query string:
   #{make_link "flamegraph", env} : works best on Ruby 2.0, a graph representing sampled activity (requires the flamegraph gem).
   #{make_link "flamegraph&flamegraph_sample_rate=1", env}: creates a flamegraph with the specified sample rate (in ms). Overrides value set in config
   #{make_link "flamegraph_embed", env} : works best on Ruby 2.0, a graph representing sampled activity (requires the flamegraph gem), embedded resources for use on an intranet.
+  #{make_link "stackprof", env} : a json representing sampled activity (requires the stackprof gem).
+  #{make_link "stackprof&stackprof_sample_rate=1", env} : creates a flamegraph with the specified sample rate (in ms). Overrides value set in config
   #{make_link "trace-exceptions", env} : requires Ruby 2.0, will return all the spots where your application raises exceptions
   #{make_link "analyze-memory", env} : requires Ruby 2.0, will perform basic memory analysis of heap
 </pre>
@@ -562,6 +594,11 @@ Append the following to your query string:
     def flamegraph(graph)
       headers = {'Content-Type' => 'text/html'}
       [200, headers, [graph]]
+    end
+
+    def stackprof(prof_data)
+      headers = {'Content-Type' => 'application/octet-stream', 'Content-Disposition' => 'attachment; filename=stackprof.output.callgrind'}
+      [200, headers, [prof_data]]
     end
 
     def ids(env)
